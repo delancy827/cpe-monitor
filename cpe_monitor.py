@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CPE Network Disconnection Monitor v2.6
+CPE Network Disconnection Monitor v2.8
+CPE网络断流监控工具 - 快慢分离检测：ping每秒 + netsh每30秒 + 失败重试
 CPE网络断流监控工具 - 三重检测：网络接口/CPE网关/外网连通性
 """
 
@@ -21,9 +22,11 @@ from flask import Flask, render_template_string, jsonify, request, Response
 # 配置部分
 # =============================================================================
 PING_TARGET = "192.168.10.1"  # CPE网关（准确检测CPE是否在线）
-PING_EXTERNAL = "8.8.8.8"       # 外网检测目标
-PING_INTERVAL = 2                 # Ping间隔（秒）
-TIMEOUT = 3
+PING_EXTERNAL = "8.8.8.8"       # 外网检测目标（备用）
+PING_INTERVAL = 1                 # Ping间隔（秒），1秒提高检测精度
+TIMEOUT = 2                       # Ping超时（秒）
+RETRY_TIMEOUT = 1                 # 失败重试超时（秒），更快确认
+NETSH_INTERVAL = 30               # 网络接口状态检查间隔（秒）
 SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0                       # Ping超时时间（秒）
 # DB路径：exe所在目录（PyInstaller打包）或脚本所在目录（直接运行）
 if getattr(sys, 'frozen', False):
@@ -55,7 +58,7 @@ stats = {
     "current_status": "online",
     "current_offline_start": None,
     "conn_type": "检测中...",
-    "version": "v2.6"
+    "version": "v2.8"
 }
 
 # =============================================================================
@@ -434,54 +437,59 @@ def check_network_connected():
 # 监控函数
 # =============================================================================
 def monitor():
-    """主监控循环"""
+    """主监控循环 — 快慢分离：ping每秒检测，netsh每30秒检测"""
     global monitoring, current_status, last_online_time, current_offline_start, last_wifi_status, monitor_session_id
     
     monitor_session_id = start_monitor_session()
-    print("[Monitor] 监控线程已启动")
+    print("[Monitor] 监控线程已启动 (ping间隔={}s, 超时={}s)".format(PING_INTERVAL, TIMEOUT))
     print("[Monitor] 网络检测: 有线+WiFi双模")
+    
+    # 慢速检测初始化
+    network_ok, eth_ok, wifi_ok = check_network_connected()
+    last_netsh_check = time.time()
+    loop_count = 0
     
     while monitoring:
         now = datetime.now()
+        loop_count += 1
         
-        # 1. 检查网络连接状态（有线+WiFi双模检测）
-        network_ok, eth_ok, wifi_ok = check_network_connected()
+        # 慢速检测：网络接口状态（每NETSH_INTERVAL秒一次）
+        if time.time() - last_netsh_check >= NETSH_INTERVAL:
+            network_ok, eth_ok, wifi_ok = check_network_connected()
+            last_netsh_check = time.time()
+            # 更新连接类型显示
+            if eth_ok and wifi_ok:
+                stats["conn_type"] = "以太网 + WiFi"
+            elif eth_ok:
+                stats["conn_type"] = "以太网"
+            elif wifi_ok:
+                stats["conn_type"] = "WiFi"
+            else:
+                stats["conn_type"] = "无连接"
         
-        # 更新连接类型显示
-        if eth_ok and wifi_ok:
-            stats["conn_type"] = "以太网 + WiFi"
-        elif eth_ok:
-            stats["conn_type"] = "以太网"
-        elif wifi_ok:
-            stats["conn_type"] = "WiFi"
-        else:
-            stats["conn_type"] = "无连接"
-        
-        # 2. Ping CPE网关
+        # 快速检测：Ping CPE网关
         cpe_online = ping(PING_TARGET, timeout=TIMEOUT)
         
-        # 诊断日志（每30次打印一次避免刷屏）
-        if not hasattr(monitor, '_diag_count'):
-            monitor._diag_count = 0
-        monitor._diag_count += 1
-        if monitor._diag_count % 30 == 1:
-            print("[Diag] net=%s eth=%s wifi=%s cpe=%s status=%s conn=%s" % (
-                network_ok, eth_ok, wifi_ok, cpe_online, current_status, stats["conn_type"]))
+        # 失败时立即重试确认（避免偶发性丢包误判）
+        if not cpe_online and network_ok:
+            cpe_online = ping(PING_TARGET, timeout=RETRY_TIMEOUT)
         
-        # 3. 判断事件类型
+        # 诊断日志（每60次~60秒打印）
+        if loop_count % 60 == 1:
+            print("[Diag] loop=%d net=%s eth=%s wifi=%s cpe=%s status=%s" % (
+                loop_count, network_ok, eth_ok, wifi_ok, cpe_online, current_status))
+        
+        # 判断事件类型
         event_type = "unknown"
         is_online = True
         
         if not network_ok:
-            # 所有网络接口断开（有线+WiFi都断了）
             event_type = "network_disconnected"
             is_online = False
         elif not cpe_online:
-            # CPE网关不可达（CPE死机或重启）
             event_type = "cpe_unreachable"
             is_online = False
         else:
-            # 一切正常
             event_type = "online"
             is_online = True
         
