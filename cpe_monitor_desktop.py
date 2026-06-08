@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CPE Network Disconnection Monitor - Desktop Edition v2.3
-系统托盘模式：托盘常驻 + 浏览器打开监控面板
-修复：UTF-8编码检测 + 去掉pywebview改用浏览器
+CPE Network Disconnection Monitor - Desktop Edition v2.7
+系统托盘模式：托盘常驻 + 浏览器打开监控面板 + 开机自启选项
 """
 
 import sys, os, threading, time, webbrowser, socket
@@ -39,6 +38,89 @@ def run_flask():
         core.app.run(host='127.0.0.1', port=FLASK_PORT, debug=False, use_reloader=False)
     except Exception as e:
         print("[Flask] 启动失败:", e)
+
+# ============================================================
+# 开机自启管理
+# ============================================================
+def _get_startup_path():
+    """获取Windows启动文件夹路径"""
+    return os.path.join(os.environ.get('APPDATA', ''), 
+                       'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
+
+def _get_startup_shortcut():
+    """获取启动文件夹中快捷方式的完整路径"""
+    return os.path.join(_get_startup_path(), 'CPE断流监控.lnk')
+
+def _get_exe_path():
+    """获取当前运行的exe/脚本路径"""
+    if getattr(sys, 'frozen', False):
+        return sys.executable
+    else:
+        return os.path.join(SCRIPT_DIR, 'cpe_monitor_desktop.py')
+
+def is_autostart_enabled():
+    """检查是否已设置开机自启"""
+    return os.path.exists(_get_startup_shortcut())
+
+def enable_autostart():
+    """启用开机自启：在启动文件夹创建快捷方式"""
+    shortcut_path = _get_startup_shortcut()
+    exe_path = _get_exe_path()
+    work_dir = os.path.dirname(exe_path)
+    
+    try:
+        from win32com.client import Dispatch
+        shell = Dispatch('WScript.Shell')
+        shortcut = shell.CreateShortcut(shortcut_path)
+        
+        if getattr(sys, 'frozen', False):
+            # 打包后的exe，直接指向exe
+            shortcut.TargetPath = exe_path
+            shortcut.WorkingDirectory = work_dir
+        else:
+            # 从源码运行，指向 pythonw.exe 运行脚本
+            shortcut.TargetPath = sys.executable.replace('python.exe', 'pythonw.exe')
+            shortcut.Arguments = '"' + exe_path + '"'
+            shortcut.WorkingDirectory = work_dir
+        
+        shortcut.Description = 'CPE断流监控'
+        shortcut.Save()
+        print('[Startup] 已启用开机自启')
+        return True
+    except Exception as e:
+        print('[Startup] 创建快捷方式失败:', e)
+        # 备用方案：创建vbs启动脚本
+        try:
+            vbs_path = shortcut_path.replace('.lnk', '.vbs')
+            with open(vbs_path, 'w', encoding='utf-8') as f:
+                f.write('CreateObject("WScript.Shell").Run """' + exe_path + '""", 0, False\n')
+            print('[Startup] 已用VBS方案启用开机自启')
+            return True
+        except Exception as e2:
+            print('[Startup] VBS方案也失败:', e2)
+            return False
+
+def disable_autostart():
+    """禁用开机自启：删除启动文件夹中的快捷方式"""
+    shortcut_path = _get_startup_shortcut()
+    deleted = False
+    for p in [shortcut_path, shortcut_path.replace('.lnk', '.vbs')]:
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+                deleted = True
+        except:
+            pass
+    if deleted:
+        print('[Startup] 已禁用开机自启')
+    return True
+
+def _toggle_autostart(icon=None, item=None):
+    """切换开机自启状态"""
+    if is_autostart_enabled():
+        disable_autostart()
+    else:
+        enable_autostart()
 
 # ============================================================
 # 托盘图标
@@ -84,6 +166,10 @@ def start_tray():
     img = _load_tray_image()
     menu = pystray.Menu(
         pystray.MenuItem("打开监控面板", _toggle_browser, default=True),
+        pystray.MenuItem(
+            "开机自启", _toggle_autostart,
+            checked=lambda item: is_autostart_enabled()
+        ),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("退出监控", _quit_app),
     )
@@ -101,8 +187,9 @@ def main():
         return
 
     print("=" * 50)
-    print("CPE 断流监控 v2.3")
+    print("CPE 断流监控 v2.7")
     print("托盘常驻后台 | 点击托盘打开监控面板")
+    print("开机自启: {0}".format("已启用" if is_autostart_enabled() else "未启用"))
     print("=" * 50)
 
     # 初始化数据库
