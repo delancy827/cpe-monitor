@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CPE Network Disconnection Monitor v2.9
+CPE Network Disconnection Monitor v2.9.1
 CPE网络断流监控工具 - 多维度检测 + 连续失败阈值
+
+修复内容（v2.9.1）：
+1. 修复遗留会话的结束时间显示为"进行中..."的问题
+2. 修复退出时未调用end_monitor_session()导致会话未正确关闭
+3. 监控时段表格增加"断流次数"列
+4. 修复数据库初始化时遗留active会话未设置end_time和duration
 
 优化内容（v2.9）：
 1. 多维度探测：ICMP ping网关 + ICMP ping公网 + TCP连接检测 + DNS解析检测
@@ -84,7 +90,7 @@ stats = {
     "current_status": "online",
     "current_offline_start": None,
     "conn_type": "检测中...",
-    "version": "v2.9",
+    "version": "v2.9.1",
     # 多维度统计
     "ping_gateway_fail_rate": 0,
     "ping_external_fail_rate": 0,
@@ -131,7 +137,11 @@ def init_db():
                   status TEXT DEFAULT 'active')''')
     
     # 关闭上次未正常结束的会话（异常退出遗留的active记录）
-    c.execute("UPDATE monitor_sessions SET status='interrupted' WHERE status='active'")
+    # 同时设置 end_time 和 duration，避免前端显示"进行中..."
+    now = datetime.now()
+    c.execute("""UPDATE monitor_sessions 
+                 SET end_time = ?, duration = (julianday(?) - julianday(start_time)) * 86400, status = 'interrupted'
+                 WHERE status = 'active'""", (now.isoformat(), now.isoformat()))
     
     conn.commit()
     conn.close()
@@ -280,26 +290,33 @@ def end_monitor_session(session_id):
     conn.close()
 
 def get_today_sessions():
-    """获取今天的监控会话记录（使用本地时间，避免UTC时区偏差）"""
+    """获取今天的监控会话记录，附带每个时段的断流次数"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # 使用 datetime('now', 'localtime') 获取本地日期，避免UTC/北京时间偏差
     c.execute("""SELECT start_time, end_time, duration, status, id
                  FROM monitor_sessions
                  WHERE date(start_time) = date('now', 'localtime')
                  ORDER BY start_time ASC""")
     rows = c.fetchall()
-    conn.close()
     
     sessions = []
     for row in rows:
+        sid, start, end, duration, status = row[4], row[0], row[1], row[2] or 0, row[3]
+        # 计算该会话时段内的断流次数
+        end_q = end if end else datetime.now().isoformat()
+        c.execute("""SELECT COUNT(*) FROM events
+                     WHERE start_time >= ? AND start_time <= ?""",
+                  (start, end_q))
+        disconnection_count = c.fetchone()[0]
         sessions.append({
-            "start": row[0],
-            "end": row[1],
-            "duration": row[2] or 0,
-            "status": row[3],
-            "id": row[4]
+            "start": start,
+            "end": end,
+            "duration": duration,
+            "status": status,
+            "id": sid,
+            "disconnections": disconnection_count
         })
+    conn.close()
     return sessions
 
 def get_today_monitor_minutes():
@@ -502,7 +519,7 @@ def monitor():
     global monitor_session_id
     
     monitor_session_id = start_monitor_session()
-    print("[Monitor] 监控线程已启动 (v2.9 多维度检测)")
+    print("[Monitor] 监控线程已启动 (v2.9.1 多维度检测)")
     print("[Monitor] Ping网关: {} (间隔{}s)".format(PING_TARGET, PING_INTERVAL))
     print("[Monitor] Ping公网: {} (间隔{}s)".format(PING_EXTERNAL, PING_INTERVAL))
     print("[Monitor] TCP检测: {}:{} (间隔{}s)".format(TCP_TEST_HOST, TCP_TEST_PORT, TCP_TEST_INTERVAL))
@@ -646,7 +663,7 @@ HTML_TEMPLATE = '''
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>CPE 断流监控 v2.9</title>
+    <title>CPE 断流监控 v2.9.1</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         * { margin:0; padding:0; box-sizing:border-box; }
@@ -686,7 +703,7 @@ HTML_TEMPLATE = '''
     <div class="container">
         <div class="header">
             <h1>📡 CPE 断流监控</h1>
-            <p>版本: <span id="version">v2.9</span> | 连接类型: <span id="conn-type">检测中...</span> | 监控时长: <span id="monitor-hours">0</span> 小时</p>
+            <p>版本: <span id="version">v2.9.1</span> | 连接类型: <span id="conn-type">检测中...</span> | 监控时长: <span id="monitor-hours">0</span> 小时</p>
         </div>
 
         <div class="stats-grid">
@@ -854,11 +871,13 @@ HTML_TEMPLATE = '''
                         container.innerHTML = '<p style="color:#636e72;">今日暂无监控记录</p>';
                         return;
                     }
-                    let html = '<table><thead><tr><th>开始时间</th><th>结束时间</th><th>持续时长</th><th>状态</th></tr></thead><tbody>';
+                    let html = '<table><thead><tr><th>开始时间</th><th>结束时间</th><th>持续时长</th><th>断流次数</th><th>状态</th></tr></thead><tbody>';
                     sessions.forEach(s => {
                         const end = s.end || '进行中...';
                         const status = s.status === 'active' ? '🟢 监测中' : '⚪ 已结束';
-                        html += `<tr><td>${s.start}</td><td>${end}</td><td>${(s.duration / 60).toFixed(1)} 分钟</td><td>${status}</td></tr>`;
+                        const dc = s.disconnections || 0;
+                        const dcStyle = dc > 0 ? 'style="color:#e74c3c;font-weight:bold;"' : 'style="color:#27ae60;"';
+                        html += `<tr><td>${s.start}</td><td>${end}</td><td>${(s.duration / 60).toFixed(1)} 分钟</td><td ${dcStyle}>${dc} 次</td><td>${status}</td></tr>`;
                     });
                     html += '</tbody></table>';
                     container.innerHTML = html;
@@ -960,7 +979,7 @@ def api_test_disconnect():
 if __name__ == '__main__':
     init_db()
     print("=" * 50)
-    print("CPE 断流监控 v2.9")
+    print("CPE 断流监控 v2.9.1")
     print("多维度检测 + 连续失败阈值")
     print("=" * 50)
     

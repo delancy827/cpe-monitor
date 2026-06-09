@@ -169,10 +169,15 @@ def _toggle_browser(icon=None, item=None):
     webbrowser.open(FLASK_URL)
 
 def _quit_app(icon=None, item=None):
-    """退出应用"""
+    """退出应用：先结束监控会话再退出"""
     print("[Exit] 正在退出...")
+    # 先结束监控会话，确保数据库正确记录结束时间和时长
+    try:
+        core.end_monitor_session(core.monitor_session_id)
+    except Exception as e:
+        print("[Exit] 结束监控会话失败:", e)
     core.monitoring = False
-    time.sleep(3)
+    time.sleep(1)
     try:
         icon.stop()
     except:
