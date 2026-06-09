@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CPE Network Disconnection Monitor - Desktop Edition v2.7
+CPE Network Disconnection Monitor - Desktop Edition v2.8.1
 系统托盘模式：托盘常驻 + 浏览器打开监控面板 + 开机自启选项
+修复：单实例检测改为杀掉旧进程后重启，避免托盘无法创建
 """
 
-import sys, os, threading, time, webbrowser, socket
+import sys, os, threading, time, webbrowser, socket, subprocess
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -14,11 +15,35 @@ if SCRIPT_DIR not in sys.path:
 import cpe_monitor as core
 
 FLASK_PORT = 5000
-FLASK_URL = "http://127.0.0.1:{0}".format(FLASK_PORT)
+FLASK_URL = "http://127.0.0.1:{}".format(FLASK_PORT)
 
-# ============================================================
-# 单实例检测
-# ============================================================
+# =============================================================================
+# 单实例检测与清理
+# =============================================================================
+def kill_existing_instance():
+    """通过端口5000查找并杀掉旧进程，确保托盘能正常创建"""
+    try:
+        result = subprocess.run(
+            ['netstat', '-ano'],
+            capture_output=True, text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+        )
+        for line in result.stdout.split('\n'):
+            if ':5000' in line and 'LISTENING' in line:
+                parts = line.split()
+                pid = int(parts[-1])
+                print('[Singleton] 发现旧进程 PID={}, 正在终止...'.format(pid))
+                subprocess.run(
+                    ['taskkill', '/F', '/PID', str(pid)],
+                    capture_output=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+                )
+                time.sleep(2)
+                return True
+    except Exception as e:
+        print('[Singleton] 清理旧进程失败:', e)
+    return False
+
 def is_already_running():
     """检查是否已有实例在运行（通过检测端口）"""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -29,9 +54,9 @@ def is_already_running():
     except:
         return False
 
-# ============================================================
+# =============================================================================
 # Flask后台线程
-# ============================================================
+# =============================================================================
 def run_flask():
     """在后台线程启动Flask"""
     try:
@@ -39,12 +64,12 @@ def run_flask():
     except Exception as e:
         print("[Flask] 启动失败:", e)
 
-# ============================================================
+# =============================================================================
 # 开机自启管理
-# ============================================================
+# =============================================================================
 def _get_startup_path():
     """获取Windows启动文件夹路径"""
-    return os.path.join(os.environ.get('APPDATA', ''), 
+    return os.path.join(os.environ.get('APPDATA', ''),
                        'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
 
 def _get_startup_shortcut():
@@ -67,29 +92,26 @@ def enable_autostart():
     shortcut_path = _get_startup_shortcut()
     exe_path = _get_exe_path()
     work_dir = os.path.dirname(exe_path)
-    
+
     try:
         from win32com.client import Dispatch
         shell = Dispatch('WScript.Shell')
         shortcut = shell.CreateShortcut(shortcut_path)
-        
+
         if getattr(sys, 'frozen', False):
-            # 打包后的exe，直接指向exe
             shortcut.TargetPath = exe_path
             shortcut.WorkingDirectory = work_dir
         else:
-            # 从源码运行，指向 pythonw.exe 运行脚本
             shortcut.TargetPath = sys.executable.replace('python.exe', 'pythonw.exe')
             shortcut.Arguments = '"' + exe_path + '"'
             shortcut.WorkingDirectory = work_dir
-        
+
         shortcut.Description = 'CPE断流监控'
         shortcut.Save()
         print('[Startup] 已启用开机自启')
         return True
     except Exception as e:
         print('[Startup] 创建快捷方式失败:', e)
-        # 备用方案：创建vbs启动脚本
         try:
             vbs_path = shortcut_path.replace('.lnk', '.vbs')
             with open(vbs_path, 'w', encoding='utf-8') as f:
@@ -122,13 +144,12 @@ def _toggle_autostart(icon=None, item=None):
     else:
         enable_autostart()
 
-# ============================================================
+# =============================================================================
 # 托盘图标
-# ============================================================
+# =============================================================================
 def _load_tray_image():
     """加载托盘图标"""
     from PIL import Image
-    # PyInstaller bundle vs 直接运行
     paths = [
         os.path.join(SCRIPT_DIR, 'tray_icon.png'),
         os.path.join(sys._MEIPASS, 'tray_icon.png') if hasattr(sys, '_MEIPASS') else None,
@@ -136,7 +157,6 @@ def _load_tray_image():
     for p in paths:
         if p and os.path.exists(p):
             return Image.open(p)
-    # 内存中创建一个简单图标
     img = Image.new('RGBA', (32, 32), (0, 0, 0, 0))
     from PIL import ImageDraw
     d = ImageDraw.Draw(img)
@@ -152,7 +172,6 @@ def _quit_app(icon=None, item=None):
     """退出应用"""
     print("[Exit] 正在退出...")
     core.monitoring = False
-    # 等待监控循环结束（让 end_monitor_session 有时间写入DB）
     time.sleep(3)
     try:
         icon.stop()
@@ -167,7 +186,8 @@ def start_tray():
     menu = pystray.Menu(
         pystray.MenuItem("打开监控面板", _toggle_browser, default=True),
         pystray.MenuItem(
-            "开机自启", _toggle_autostart,
+            "开机自启",
+            _toggle_autostart,
             checked=lambda item: is_autostart_enabled()
         ),
         pystray.Menu.SEPARATOR,
@@ -176,20 +196,19 @@ def start_tray():
     icon = pystray.Icon("cpe_monitor", img, "CPE 断流监控", menu)
     icon.run()
 
-# ============================================================
+# =============================================================================
 # 主入口
-# ============================================================
+# =============================================================================
 def main():
-    # 单实例检测
+    # 先杀掉占用5000端口的旧进程，确保托盘能正常创建
     if is_already_running():
-        print("[Singleton] 已有实例在运行，打开浏览器...")
-        webbrowser.open(FLASK_URL)
-        return
+        print("[Singleton] 检测到旧进程，正在清理...")
+        kill_existing_instance()
 
     print("=" * 50)
-    print("CPE 断流监控 v2.7")
+    print("CPE 断流监控 v2.8.1")
     print("托盘常驻后台 | 点击托盘打开监控面板")
-    print("开机自启: {0}".format("已启用" if is_autostart_enabled() else "未启用"))
+    print("开机自启: {}".format("已启用" if is_autostart_enabled() else "未启用"))
     print("=" * 50)
 
     # 初始化数据库

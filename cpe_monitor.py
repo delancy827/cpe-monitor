@@ -178,19 +178,19 @@ def get_stats_from_db():
     return result
 
 def get_hourly_stats():
-    """获取24小时断流统计（按小时分组）"""
+    """获取24小时断流统计（按小时分组）——只统计今天的数据"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
     # 初始化24小时数组
     hourly = [0] * 24
     
-    # 查询最近7天的断流事件，按小时统计
+    # 查询今天的断流事件，按小时统计（避免跨天数据混入；使用本地时间）
     c.execute("""SELECT 
                     CAST(strftime('%H', start_time) AS INTEGER) as hour,
                     COUNT(*) as cnt
                  FROM events
-                 WHERE start_time > datetime('now', '-7 days')
+                 WHERE date(start_time) = date('now', 'localtime')
                  GROUP BY hour
                  ORDER BY hour""")
     
@@ -246,12 +246,13 @@ def end_monitor_session(session_id):
 
 
 def get_today_sessions():
-    """获取今天的监控会话记录"""
+    """获取今天的监控会话记录（使用本地时间，避免UTC时区偏差）"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    # 使用 datetime('now', 'localtime') 获取本地日期，避免UTC/北京时间偏差
     c.execute("""SELECT start_time, end_time, duration, status, id
                  FROM monitor_sessions
-                 WHERE date(start_time) = date('now')
+                 WHERE date(start_time) = date('now', 'localtime')
                  ORDER BY start_time ASC""")
     rows = c.fetchall()
     conn.close()
@@ -309,10 +310,10 @@ def get_monitor_time_stats():
     c = conn.cursor()
     now = datetime.now()
     
-    # 今天的总监控时长
+    # 今天的总监控时长（使用本地时间）
     c.execute("""SELECT id, start_time, end_time, duration, status
                  FROM monitor_sessions
-                 WHERE date(start_time) = date('now')""")
+                 WHERE date(start_time) = date('now', 'localtime')""")
     rows = c.fetchall()
     
     today_seconds = 0
@@ -721,7 +722,7 @@ function updateData(){
         document.getElementById('disconnection-rate').textContent=(d.disconnection_rate||0).toFixed(2);
         document.getElementById('total-downtime').textContent=d.total_downtime.toFixed(1)+' 秒';
         document.getElementById('avg-downtime').textContent=d.avg_downtime.toFixed(1)+' 秒';
-        document.getElementById('avg-interval').textContent=d.avg_interval>0?d.avg_interval.toFixed(1)+' 秒':'--';
+        document.getElementById('avg-interval').textContent=d.avg_interval>0?(d.avg_interval/3600).toFixed(1)+' 小时':'--';
         document.getElementById('monitor-week').textContent=formatHours(d.monitor_week_seconds||0);
     }).catch(console.error);
     fetch('/api/events?limit=20').then(r=>r.json()).then(events=>{
@@ -777,10 +778,10 @@ def api_status():
     time_stats = get_monitor_time_stats()
     today_sec = time_stats["today_seconds"]
     
-    # 今天的断流次数（只统计今天的）
+    # 今天的断流次数（只统计今天的，使用本地时间避免UTC偏差）
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT COUNT(*), COALESCE(SUM(duration),0) FROM events WHERE date(start_time) = date('now')")
+    c.execute("SELECT COUNT(*), COALESCE(SUM(duration),0) FROM events WHERE date(start_time) = date('now', 'localtime')")
     today_events, today_downtime = c.fetchone()
     conn.close()
     
