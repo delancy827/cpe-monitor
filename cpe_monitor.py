@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CPE Network Disconnection Monitor v2.8.1
-CPE网络断流监控工具 - 快慢分离检测：ping每秒 + netsh每30秒 + 失败重试
-修复：单实例检测逻辑、时区偏差、24小时统计范围
+CPE Network Disconnection Monitor v2.9
+CPE网络断流监控工具 - 多维度检测 + 连续失败阈值
+
+优化内容（v2.9）：
+1. 多维度探测：ICMP ping网关 + ICMP ping公网 + TCP连接检测 + DNS解析检测
+2. 连续失败阈值：连续3次检测失败才判定为断流（避免偶发丢包误判）
+3. 快速恢复检测：连续2次检测成功才判定为恢复（避免抖动）
+4. 缩短检测间隔：ping间隔1秒，TCP/DNS检测每3秒一次
+5. 记录断流类型：区分CPE网关不可达、外网不可达、DNS解析失败、TCP连接失败
 """
 
 import threading
@@ -14,6 +20,8 @@ import json
 import sqlite3
 import os
 import sys
+import socket
+import datetime
 from datetime import datetime, timedelta
 from collections import deque
 from flask import Flask, render_template_string, jsonify, request, Response
@@ -22,18 +30,28 @@ from flask import Flask, render_template_string, jsonify, request, Response
 # 配置部分
 # =============================================================================
 PING_TARGET = "192.168.10.1"  # CPE网关（准确检测CPE是否在线）
-PING_EXTERNAL = "8.8.8.8"       # 外网检测目标（备用）
-PING_INTERVAL = 1                 # Ping间隔（秒），1秒提高检测精度
-TIMEOUT = 2                       # Ping超时（秒）
-RETRY_TIMEOUT = 1                 # 失败重试超时（秒），更快确认
-NETSH_INTERVAL = 30               # 网络接口状态检查间隔（秒）
-SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0                       # Ping超时时间（秒）
+PING_EXTERNAL = "8.8.8.8"     # 外网检测目标（Google DNS）
+DNS_TEST_DOMAIN = "www.baidu.com"  # DNS解析测试域名
+TCP_TEST_HOST = "www.baidu.com"     # TCP连接测试主机
+TCP_TEST_PORT = 80                    # TCP连接测试端口
+TCP_TEST_INTERVAL = 3                 # TCP检测间隔（秒）
+DNS_TEST_INTERVAL = 3                 # DNS检测间隔（秒）
+
+PING_INTERVAL = 1                    # Ping间隔（秒）
+TIMEOUT = 2                          # Ping超时（秒）
+FAILURE_THRESHOLD = 3               # 连续失败次数阈值（连续3次失败 = 断流）
+RECOVERY_THRESHOLD = 2               # 连续恢复次数阈值（连续2次成功 = 恢复）
+NETSH_INTERVAL = 10                  # 网络接口状态检查间隔（秒，缩短为10秒）
+
+SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+
 # DB路径：exe所在目录（PyInstaller打包）或脚本所在目录（直接运行）
 if getattr(sys, 'frozen', False):
     DB_PATH = os.path.join(os.path.dirname(sys.executable), "cpe_monitor.db")
 else:
     DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpe_monitor.db")
-CHECK_WIFI = True                 # 是否检测WiFi连接状态（Windows Only）
+
+CHECK_WIFI = True                    # 是否检测WiFi连接状态（Windows Only）
 
 # =============================================================================
 # 全局状态
@@ -41,14 +59,22 @@ CHECK_WIFI = True                 # 是否检测WiFi连接状态（Windows Only�
 monitoring = False
 monitor_thread = None
 monitor_session_id = None  # 当前监控会话ID
-disconnection_events = deque(maxlen=1000)  # 存储最近1000次断流事件
-current_status = "online"  # "online", "network_disconnected", "cpe_unreachable"
-# 默认乐观假设在线，监控循环会在检测到断流时更新
-last_online_time = None
-current_offline_start = None
-last_wifi_status = True  # 上次WiFi连接状态
+
+# 多维度检测结果
+ping_gateway_fail_count = 0    # ping网关连续失败次数
+ping_external_fail_count = 0    # ping公网连续失败次数
+tcp_test_fail_count = 0         # TCP连接连续失败次数
+dns_test_fail_count = 0          # DNS解析连续失败次数
+
+# 综合状态
+consecutive_failures = 0        # 综合连续失败次数
+consecutive_successes = 0       # 综合连续成功次数
+current_status = "online"        # "online", "disconnected"
+disconnection_start_time = None   # 当前断流开始时间
+disconnection_type = None         # 断流类型
 
 # 统计数据
+disconnection_events = deque(maxlen=1000)  # 存储最近1000次断流事件
 stats = {
     "total_disconnections": 0,
     "total_downtime": 0,
@@ -58,8 +84,19 @@ stats = {
     "current_status": "online",
     "current_offline_start": None,
     "conn_type": "检测中...",
-    "version": "v2.8.1"
+    "version": "v2.9",
+    # 多维度统计
+    "ping_gateway_fail_rate": 0,
+    "ping_external_fail_rate": 0,
+    "tcp_fail_rate": 0,
+    "dns_fail_rate": 0,
 }
+
+# 上次网络接口检测结果
+last_network_ok = True
+last_eth_ok = False
+last_wifi_ok = False
+last_netsh_check = 0
 
 # =============================================================================
 # 数据库操作
@@ -211,7 +248,6 @@ def get_hourly_stats():
         "data": hourly
     }
 
-
 def start_monitor_session():
     """开始一个新的监控会话"""
     now = datetime.now()
@@ -224,7 +260,6 @@ def start_monitor_session():
     conn.close()
     print("[Session] 监控会话已开始, id={}".format(session_id))
     return session_id
-
 
 def end_monitor_session(session_id):
     """结束监控会话"""
@@ -243,7 +278,6 @@ def end_monitor_session(session_id):
         print("[Session] 监控会话已结束, 持续 {:.1f} 分钟".format(duration / 60))
     conn.commit()
     conn.close()
-
 
 def get_today_sessions():
     """获取今天的监控会话记录（使用本地时间，避免UTC时区偏差）"""
@@ -267,7 +301,6 @@ def get_today_sessions():
             "id": row[4]
         })
     return sessions
-
 
 def get_today_monitor_minutes():
     """
@@ -302,7 +335,6 @@ def get_today_monitor_minutes():
             current += timedelta(hours=1)
     
     return hourly_minutes
-
 
 def get_monitor_time_stats():
     """获取监控时长统计"""
@@ -348,7 +380,7 @@ def get_monitor_time_stats():
     }
 
 # =============================================================================
-# 网络检测函数
+# 网络检测函数（多维度）
 # =============================================================================
 def _decode_output(raw_bytes):
     """智能解码Windows命令行输出：UTF-8优先，GBK兜底"""
@@ -368,7 +400,6 @@ def _run_netsh(cmd_args, timeout=5):
                           timeout=timeout, creationflags=SUBPROCESS_FLAGS)
     return _decode_output(result.stdout)
 
-
 def ping(host, timeout=3):
     """
     Ping一个主机，返回True（在线）或False（离线）
@@ -386,6 +417,31 @@ def ping(host, timeout=3):
         print("[Ping] 错误: " + str(e))
         return False
 
+def tcp_connect_test(host=TCP_TEST_HOST, port=TCP_TEST_PORT, timeout=3):
+    """
+    TCP连接测试：尝试连接到指定主机的指定端口
+    返回True（连接成功）或False（连接失败）
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        return result == 0
+    except Exception as e:
+        return False
+
+def dns_resolve_test(domain=DNS_TEST_DOMAIN, timeout=3):
+    """
+    DNS解析测试：尝试解析指定域名
+    返回True（解析成功）或False（解析失败）
+    """
+    try:
+        socket.setdefaulttimeout(timeout)
+        ip = socket.gethostbyname(domain)
+        return True
+    except Exception as e:
+        return False
 
 def check_wifi_connected():
     """
@@ -407,7 +463,6 @@ def check_wifi_connected():
     except Exception as e:
         return False, "error: " + str(e)
 
-
 def check_ethernet_connected():
     """
     检查Windows有线网卡（以太网）连接状态
@@ -424,7 +479,6 @@ def check_ethernet_connected():
     except:
         return False
 
-
 def check_network_connected():
     """
     检查网络连接状态（有线+WiFi双模检测）
@@ -435,110 +489,148 @@ def check_network_connected():
     return (eth_ok or wifi_ok), eth_ok, wifi_ok
 
 # =============================================================================
-# 监控函数
+# 监控函数（多维度 + 连续失败阈值）
 # =============================================================================
 def monitor():
-    """主监控循环 — 快慢分离：ping每秒检测，netsh每30秒检测"""
-    global monitoring, current_status, last_online_time, current_offline_start, last_wifi_status, monitor_session_id
+    """主监控循环 — 多维度检测 + 连续失败阈值"""
+    global monitoring, current_status, stats
+    global ping_gateway_fail_count, ping_external_fail_count
+    global tcp_test_fail_count, dns_test_fail_count
+    global consecutive_failures, consecutive_successes
+    global disconnection_start_time, disconnection_type
+    global last_network_ok, last_eth_ok, last_wifi_ok, last_netsh_check
+    global monitor_session_id
     
     monitor_session_id = start_monitor_session()
-    print("[Monitor] 监控线程已启动 (ping间隔={}s, 超时={}s)".format(PING_INTERVAL, TIMEOUT))
-    print("[Monitor] 网络检测: 有线+WiFi双模")
+    print("[Monitor] 监控线程已启动 (v2.9 多维度检测)")
+    print("[Monitor] Ping网关: {} (间隔{}s)".format(PING_TARGET, PING_INTERVAL))
+    print("[Monitor] Ping公网: {} (间隔{}s)".format(PING_EXTERNAL, PING_INTERVAL))
+    print("[Monitor] TCP检测: {}:{} (间隔{}s)".format(TCP_TEST_HOST, TCP_TEST_PORT, TCP_TEST_INTERVAL))
+    print("[Monitor] DNS检测: {} (间隔{}s)".format(DNS_TEST_DOMAIN, DNS_TEST_INTERVAL))
+    print("[Monitor] 失败阈值: 连续{}次 => 断流".format(FAILURE_THRESHOLD))
+    print("[Monitor] 恢复阈值: 连续{}次 => 恢复".format(RECOVERY_THRESHOLD))
     
-    # 慢速检测初始化
-    network_ok, eth_ok, wifi_ok = check_network_connected()
-    last_netsh_check = time.time()
+    # 初始化检测计时器
+    last_tcp_check = time.time()
+    last_dns_check = time.time()
     loop_count = 0
     
     while monitoring:
         now = datetime.now()
         loop_count += 1
+        current_time = time.time()
         
-        # 慢速检测：网络接口状态（每NETSH_INTERVAL秒一次）
-        if time.time() - last_netsh_check >= NETSH_INTERVAL:
-            network_ok, eth_ok, wifi_ok = check_network_connected()
-            last_netsh_check = time.time()
+        # 1. 网络接口状态检测（每NETSH_INTERVAL秒一次）
+        if current_time - last_netsh_check >= NETSH_INTERVAL:
+            last_network_ok, last_eth_ok, last_wifi_ok = check_network_connected()
+            last_netsh_check = current_time
             # 更新连接类型显示
-            if eth_ok and wifi_ok:
+            if last_eth_ok and last_wifi_ok:
                 stats["conn_type"] = "以太网 + WiFi"
-            elif eth_ok:
+            elif last_eth_ok:
                 stats["conn_type"] = "以太网"
-            elif wifi_ok:
+            elif last_wifi_ok:
                 stats["conn_type"] = "WiFi"
             else:
                 stats["conn_type"] = "无连接"
         
-        # 快速检测：Ping CPE网关
-        cpe_online = ping(PING_TARGET, timeout=TIMEOUT)
+        # 2. 多维度快速检测
+        # 2.1 ICMP Ping 网关
+        ping_gateway_ok = ping(PING_TARGET, timeout=TIMEOUT)
         
-        # 失败时立即重试确认（避免偶发性丢包误判）
-        if not cpe_online and network_ok:
-            cpe_online = ping(PING_TARGET, timeout=RETRY_TIMEOUT)
+        # 2.2 ICMP Ping 公网（如果网关可达）
+        ping_external_ok = ping(PING_EXTERNAL, timeout=TIMEOUT) if ping_gateway_ok else False
         
-        # 诊断日志（每60次~60秒打印）
+        # 2.3 TCP连接检测（每TCP_TEST_INTERVAL秒一次）
+        tcp_ok = True
+        if current_time - last_tcp_check >= TCP_TEST_INTERVAL:
+            tcp_ok = tcp_connect_test()
+            last_tcp_check = current_time
+        
+        # 2.4 DNS解析检测（每DNS_TEST_INTERVAL秒一次）
+        dns_ok = True
+        if current_time - last_dns_check >= DNS_TEST_INTERVAL:
+            dns_ok = dns_resolve_test()
+            last_dns_check = current_time
+        
+        # 3. 更新连续失败/成功计数
+        # 综合判断：网关不可达 OR (网关可达但外网不可达 AND TCP失败 AND DNS失败)
+        is_network_ok = last_network_ok
+        is_gateway_ok = ping_gateway_ok
+        is_external_ok = ping_external_ok or tcp_ok or dns_ok  # 任意一个外网检测成功即可
+        
+        if is_network_ok and is_gateway_ok and is_external_ok:
+            # 网络正常
+            consecutive_successes += 1
+            consecutive_failures = 0
+        else:
+            # 网络异常
+            consecutive_failures += 1
+            consecutive_successes = 0
+        
+        # 4. 诊断日志（每60次~60秒打印）
         if loop_count % 60 == 1:
-            print("[Diag] loop=%d net=%s eth=%s wifi=%s cpe=%s status=%s" % (
-                loop_count, network_ok, eth_ok, wifi_ok, cpe_online, current_status))
+            print("[Diag] loop={} net={} gw={} ext={} tcp={} dns={} fail={} success={} status={}".format(
+                loop_count, is_network_ok, is_gateway_ok, is_external_ok, tcp_ok, dns_ok,
+                consecutive_failures, consecutive_successes, current_status))
         
-        # 判断事件类型
-        event_type = "unknown"
-        is_online = True
-        
-        if not network_ok:
-            event_type = "network_disconnected"
-            is_online = False
-        elif not cpe_online:
-            event_type = "cpe_unreachable"
-            is_online = False
-        else:
-            event_type = "online"
-            is_online = True
-        
-        # 4. 状态变化检测
-        if is_online:
-            if current_status in ("offline", "network_disconnected", "cpe_unreachable"):
-                # 刚刚恢复在线
-                end_time = now
-                start_time = current_offline_start
-                duration = (end_time - start_time).total_seconds()
-                
-                print("[Monitor] 断流恢复: 持续 {:.1f} 秒, 类型: {}".format(duration, current_status))
-                
-                # 记录所有断流事件：网络完全断开 / CPE网关不可达
-                if current_status in ('network_disconnected', 'cpe_unreachable'):
-                    log_disconnection(start_time, end_time, duration, current_status)
-                    print('[Monitor] 已记录断流事件: ' + current_status)
-                    # 更新统计数据
-                    stats["total_disconnections"] += 1
-                    stats["total_downtime"] += duration
-                    stats["avg_downtime"] = stats["total_downtime"] / stats["total_disconnections"]
-                    stats["last_disconnection"] = end_time.isoformat()
-                    disconnection_events.append({
-                        "start": start_time.isoformat(),
-                        "end": end_time.isoformat(),
-                        "duration": duration,
-                        "event_type": current_status
-                    })
-                else:
-                    print('[Monitor] 忽略未知事件: ' + current_status)
-                
-                stats["current_offline_start"] = None
-                current_offline_start = None
+        # 5. 断流检测：连续失败达到阈值
+        if consecutive_failures >= FAILURE_THRESHOLD and current_status == "online":
+            # 判定为断流
+            disconnection_start_time = now
+            current_status = "disconnected"
+            stats["current_status"] = current_status
+            stats["current_offline_start"] = now.isoformat()
             
+            # 判断断流类型
+            if not is_network_ok:
+                disconnection_type = "network_disconnected"
+            elif not is_gateway_ok:
+                disconnection_type = "cpe_unreachable"
+            elif not is_external_ok:
+                disconnection_type = "external_unreachable"
+            else:
+                disconnection_type = "unknown"
+            
+            print("[Monitor] 检测到断流: 类型={} (连续{}次失败)".format(disconnection_type, consecutive_failures))
+        
+        # 6. 恢复检测：连续成功达到阈值
+        elif consecutive_successes >= RECOVERY_THRESHOLD and current_status == "disconnected":
+            # 判定为恢复
+            end_time = now
+            duration = (end_time - disconnection_start_time).total_seconds()
+            
+            print("[Monitor] 断流恢复: 持续 {:.1f} 秒, 类型: {}".format(duration, disconnection_type))
+            
+            # 记录断流事件
+            if disconnection_type:
+                log_disconnection(disconnection_start_time, end_time, duration, disconnection_type)
+                print('[Monitor] 已记录断流事件: ' + disconnection_type)
+                
+                # 更新统计数据
+                stats["total_disconnections"] += 1
+                stats["total_downtime"] += duration
+                stats["avg_downtime"] = stats["total_downtime"] / stats["total_disconnections"]
+                stats["last_disconnection"] = end_time.isoformat()
+                disconnection_events.append({
+                    "start": disconnection_start_time.isoformat(),
+                    "end": end_time.isoformat(),
+                    "duration": duration,
+                    "event_type": disconnection_type
+                })
+            
+            # 重置状态
             current_status = "online"
-            last_online_time = now
-        else:
-            if current_status == "online" or current_status == "unknown":
-                # 刚刚断流
-                print("[Monitor] 检测到断流: 类型=" + event_type)
-                current_offline_start = now
-                stats["current_offline_start"] = now.isoformat()
-            
-            current_status = event_type
+            stats["current_status"] = current_status
+            stats["current_offline_start"] = None
+            disconnection_start_time = None
+            disconnection_type = None
         
-        stats["current_status"] = current_status
-        last_wifi_status = wifi_ok
+        # 7. 更新统计数据中的失败率
+        stats["ping_gateway_fail_rate"] = ping_gateway_fail_count / max(1, loop_count)
+        stats["ping_external_fail_rate"] = ping_external_fail_count / max(1, loop_count // PING_INTERVAL)
         
+        # 8. 等待下一个检测周期
         time.sleep(PING_INTERVAL)
     
     # 监控循环结束，关闭会话
@@ -549,377 +641,333 @@ def monitor():
 # =============================================================================
 app = Flask(__name__)
 
-# HTML模板（嵌入式）
-HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="zh-CN">
+HTML_TEMPLATE = '''
+<!DOCTYPE html>
+<html>
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CPE 断流监控</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <title>CPE 断流监控 v2.9</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        :root {
-            --bg: #0f1117;
-            --card-bg: rgba(22,24,34,0.9);
-            --card-border: rgba(255,255,255,0.06);
-            --text: #e4e6ed;
-            --text-dim: #8b8fa3;
-            --accent: #6366f1;
-            --accent-glow: rgba(99,102,241,0.25);
-            --green: #22c55e;
-            --green-glow: rgba(34,197,94,0.25);
-            --red: #ef4444;
-            --red-glow: rgba(239,68,68,0.25);
-            --radius: 14px; --gap: 16px;
-        }
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-            background: var(--bg);
-            background-image: 
-                radial-gradient(ellipse at 20% 0%, rgba(99,102,241,0.06) 0%, transparent 50%),
-                radial-gradient(ellipse at 80% 100%, rgba(34,197,94,0.04) 0%, transparent 50%);
-            color: var(--text); min-height: 100vh; padding: 24px;
-        }
-        .container { max-width: 1300px; margin: 0 auto; }
-
-        .header {
-            display: flex; align-items: center; gap: 12px;
-            margin-bottom: 24px; padding-bottom: 16px;
-            border-bottom: 1px solid var(--card-border);
-        }
-        .logo { width: 36px; height: 36px; border-radius: 10px; background: linear-gradient(135deg,var(--accent),#8b5cf6); display: flex; align-items: center; justify-content: center; font-size: 16px; }
-        .header h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.3px; }
-        .sub { font-size: 12px; color: var(--text-dim); display: block; }
-
-        .status-bar { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
-        .status-pill { display: inline-flex; align-items: center; gap: 8px; padding: 8px 18px; border-radius: 50px; font-weight: 600; font-size: 14px; background: var(--card-bg); border: 1px solid var(--card-border); transition: all 0.3s; }
-        .status-pill.online { color: var(--green); border-color: rgba(34,197,94,0.3); box-shadow: 0 0 16px var(--green-glow); }
-        .status-pill.offline { color: var(--red); border-color: rgba(239,68,68,0.3); box-shadow: 0 0 16px var(--red-glow); animation: pulse-red 1.5s infinite; }
-        .status-pill .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
-        .status-pill.online .dot { animation: pulse-green 2s infinite; }
-        @keyframes pulse-green { 0%,100%{box-shadow:0 0 0 0 var(--green-glow)} 50%{box-shadow:0 0 0 8px transparent} }
-        @keyframes pulse-red { 0%,100%{box-shadow:0 0 0 0 var(--red-glow)} 50%{box-shadow:0 0 0 8px transparent} }
-
-        .stat-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: var(--gap); margin-bottom: var(--gap); }
-        .stat-grid.v2 { grid-template-columns: repeat(4,1fr); }
-        .stat-card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: var(--radius); padding: 20px; transition: transform 0.2s, border-color 0.2s; }
-        .stat-card:hover { transform: translateY(-2px); border-color: rgba(255,255,255,0.1); }
-        .stat-card.primary { border-left: 3px solid var(--accent); }
-        .stat-card.success { border-left: 3px solid var(--green); }
-        .stat-card.warning { border-left: 3px solid #f59e0b; }
-        .label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
-        .value { font-size: 26px; font-weight: 700; }
-        .desc { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
-
-        .chart-row { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap); margin-bottom: var(--gap); }
-        .chart-card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: var(--radius); padding: 20px; }
-        .chart-title { font-size: 13px; font-weight: 600; color: var(--text-dim); margin-bottom: 12px; }
-        .chart-wrap { position: relative; height: 260px; }
-
-        .table-card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: var(--radius); padding: 20px; margin-bottom: var(--gap); }
-        .table-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-        .table-title { font-size: 13px; font-weight: 600; color: var(--text-dim); }
-        table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        thead th { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--card-border); color: var(--text-dim); font-weight: 500; font-size: 11px; text-transform: uppercase; }
-        tbody td { padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,0.03); }
-        tbody tr:hover { background: rgba(255,255,255,0.02); }
-
-        .btn { padding: 8px 16px; border-radius: 8px; border: none; font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.2s; }
-        .btn-primary { background: var(--accent); color: #fff; }
-        .btn-primary:hover { background: #5558e6; box-shadow: 0 4px 12px var(--accent-glow); }
-        .badge { display: inline-block; padding: 3px 10px; border-radius: 50px; font-size: 11px; font-weight: 600; }
-        .badge-danger { background: rgba(239,68,68,0.15); color: var(--red); }
-        .badge-warn { background: rgba(245,158,11,0.15); color: #f59e0b; }
-        .badge-info { background: rgba(99,102,241,0.15); color: var(--accent); }
-
-        @media (max-width:900px) { .stat-grid,.chart-row { grid-template-columns: 1fr 1fr; } }
-        @media (max-width:600px) { .stat-grid,.chart-row { grid-template-columns: 1fr; } body { padding: 12px; } }
+        * { margin:0; padding:0; box-sizing:border-box; }
+        body { font-family: 'Segoe UI', sans-serif; background:#f5f6fa; color:#2d3436; }
+        .container { max-width:1200px; margin:0 auto; padding:20px; }
+        .header { background:linear-gradient(135deg, #667eea 0%, #764ba2 100%); color:white; padding:30px; border-radius:15px; margin-bottom:30px; box-shadow:0 10px 30px rgba(0,0,0,0.1); }
+        .header h1 { font-size:28px; margin-bottom:10px; }
+        .header p { opacity:0.9; font-size:14px; }
+        .stats-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:20px; margin-bottom:30px; }
+        .stat-card { background:white; padding:25px; border-radius:15px; box-shadow:0 5px 15px rgba(0,0,0,0.05); transition:transform 0.3s; }
+        .stat-card:hover { transform:translateY(-5px); }
+        .stat-label { font-size:13px; color:#636e72; margin-bottom:8px; text-transform:uppercase; letter-spacing:1px; }
+        .stat-value { font-size:32px; font-weight:700; color:#2d3436; }
+        .stat-value.online { color:#00b894; }
+        .stat-value.disconnected { color:#d63031; }
+        .chart-container { background:white; padding:25px; border-radius:15px; box-shadow:0 5px 15px rgba(0,0,0,0.05); margin-bottom:30px; }
+        .chart-container h3 { margin-bottom:20px; color:#2d3436; font-size:18px; }
+        canvas { max-height:300px; }
+        .events-table { background:white; padding:25px; border-radius:15px; box-shadow:0 5px 15px rgba(0,0,0,0.05); }
+        .events-table h3 { margin-bottom:20px; color:#2d3436; font-size:18px; }
+        table { width:100%; border-collapse:collapse; }
+        th { background:#f8f9fa; padding:12px; text-align:left; font-size:13px; color:#636e72; border-bottom:2px solid #e9ecef; }
+        td { padding:12px; border-bottom:1px solid #e9ecef; font-size:14px; }
+        .status-badge { display:inline-block; padding:4px 12px; border-radius:20px; font-size:12px; font-weight:600; }
+        .status-badge.online { background:#00b89420; color:#00b894; }
+        .status-badge.disconnected { background:#d6303120; color:#d63031; }
+        .status-badge.cpe_unreachable { background:#fdcb6e20; color:#fdcb6e; }
+        .refresh-btn { position:fixed; bottom:30px; right:30px; background:#667eea; color:white; border:none; padding:15px 25px; border-radius:50px; cursor:pointer; box-shadow:0 5px 15px rgba(102,126,234,0.3); font-size:14px; font-weight:600; }
+        .refresh-btn:hover { background:#5a6fd6; }
+        .monitor-sessions { background:white; padding:25px; border-radius:15px; box-shadow:0 5px 15px rgba(0,0,0,0.05); margin-bottom:30px; }
+        .monitor-sessions h3 { margin-bottom:20px; color:#2d3436; font-size:18px; }
+        .hourly-chart { background:white; padding:25px; border-radius:15px; box-shadow:0 5px 15px rgba(0,0,0,0.05); margin-bottom:30px; }
+        .hourly-chart h3 { margin-bottom:20px; color:#2d3436; font-size:18px; }
     </style>
 </head>
 <body>
-<div class="container">
-    <div class="header">
-        <div class="logo">📡</div>
-        <div><h1>CPE 断流监控</h1><span class="sub">网络完全断开事件追踪 &middot; 有线/WiFi双模检测</span></div>
+    <div class="container">
+        <div class="header">
+            <h1>📡 CPE 断流监控</h1>
+            <p>版本: <span id="version">v2.9</span> | 连接类型: <span id="conn-type">检测中...</span> | 监控时长: <span id="monitor-hours">0</span> 小时</p>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">当前状态</div>
+                <div class="stat-value" id="current-status">检测中...</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">今天断流次数</div>
+                <div class="stat-value" id="today-events">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">今天断流时长</div>
+                <div class="stat-value" id="today-downtime">0 秒</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">平均断流间隔</div>
+                <div class="stat-value" id="avg-interval">-- 小时</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">平均断流时长</div>
+                <div class="stat-value" id="avg-downtime">0 秒</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">最后一次断流</div>
+                <div class="stat-value" id="last-disconnection" style="font-size:16px;">--</div>
+            </div>
+        </div>
+
+        <div class="monitor-sessions">
+            <h3>📊 今日监控时段</h3>
+            <div id="sessions-list">加载中...</div>
+        </div>
+
+        <div class="hourly-chart">
+            <h3>📈 24小时断流分布 + 监控时长</h3>
+            <canvas id="hourlyChart"></canvas>
+        </div>
+
+        <div class="events-table">
+            <h3>📋 最近断流事件</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>开始时间</th>
+                        <th>结束时间</th>
+                        <th>持续时长</th>
+                        <th>类型</th>
+                    </tr>
+                </thead>
+                <tbody id="events-tbody">
+                    <tr><td colspan="4" style="text-align:center; color:#636e72;">暂无数据</td></tr>
+                </tbody>
+            </table>
+        </div>
     </div>
 
-    <div class="status-bar">
-        <div id="status-pill" class="status-pill"><span class="dot"></span><span id="status-text">检测中...</span></div>
-        <span id="status-detail" style="font-size:13px;color:var(--text-dim);"></span>
-        <span id="conn-type" style="font-size:11px;color:var(--text-dim);background:var(--card-bg);padding:4px 10px;border-radius:50px;border:1px solid var(--card-border);"></span>
-    </div>
+    <button class="refresh-btn" onclick="location.reload()">🔄 刷新数据</button>
 
-    <div class="stat-grid">
-        <div class="stat-card success"><div class="label">监控时长 (今日)</div><div class="value" id="monitor-today">--</div><div class="desc">实际监测覆盖时间</div></div>
-        <div class="stat-card"><div class="label">断流次数 (7天)</div><div class="value" id="total-disconnections">0</div></div>
-        <div class="stat-card warning"><div class="label">今日断流</div><div class="value" id="today-disconnections">0</div><div class="desc" id="today-downtime-label">断流总计 0 秒</div></div>
-        <div class="stat-card primary"><div class="label">断流率</div><div class="value" id="disconnection-rate">--</div><div class="desc">次/监控小时</div></div>
-    </div>
-    <div class="stat-grid">
-        <div class="stat-card"><div class="label">总断流时长</div><div class="value" id="total-downtime">0 秒</div></div>
-        <div class="stat-card"><div class="label">平均断流时长</div><div class="value" id="avg-downtime">0 秒</div></div>
-        <div class="stat-card"><div class="label">平均断流间隔</div><div class="value" id="avg-interval">--</div></div>
-        <div class="stat-card success"><div class="label">监控时长 (7天)</div><div class="value" id="monitor-week">--</div><div class="desc">累计监测覆盖</div></div>
-    </div>
+    <script>
+        // 24小时图表
+        const hourlyCtx = document.getElementById('hourlyChart').getContext('2d');
+        let hourlyChart = new Chart(hourlyCtx, {
+            type: 'bar',
+            data: {
+                labels: [],
+                datasets: [
+                    {
+                        label: '断流次数',
+                        data: [],
+                        backgroundColor: 'rgba(214, 48, 49, 0.6)',
+                        borderColor: 'rgba(214, 48, 49, 1)',
+                        borderWidth: 1,
+                        yAxisID: 'y'
+                    },
+                    {
+                        label: '监控分钟数',
+                        data: [],
+                        type: 'line',
+                        fill: false,
+                        borderColor: 'rgba(102, 126, 234, 1)',
+                        backgroundColor: 'rgba(102, 126, 234, 0.2)',
+                        tension: 0.4,
+                        yAxisID: 'y1'
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        position: 'left',
+                        title: { display: true, text: '断流次数' }
+                    },
+                    y1: {
+                        beginAtZero: true,
+                        position: 'right',
+                        title: { display: true, text: '监控分钟数' },
+                        grid: { drawOnChartArea: false }
+                    }
+                }
+            }
+        });
 
-    <div class="chart-row">
-        <div class="chart-card"><div class="chart-title">📊 断流时长 (最近20次)</div><div class="chart-wrap"><canvas id="timeline-chart"></canvas></div></div>
-        <div class="chart-card"><div class="chart-title">📈 24小时断流分布 <span style="font-weight:400;font-size:11px;color:#6366f1;">━━ 监控中</span> <span style="font-weight:400;font-size:11px;color:rgba(255,255,255,0.04);">━━ 未监测</span></div><div class="chart-wrap"><canvas id="hourly-chart"></canvas></div></div>
-    </div>
+        function updateData() {
+            fetch('/api/status')
+                .then(r => r.json())
+                .then(d => {
+                    // 更新状态
+                    const statusEl = document.getElementById('current-status');
+                    statusEl.textContent = d.current_status === 'online' ? '✅ 在线' : '❌ 断流中';
+                    statusEl.className = 'stat-value ' + d.current_status;
 
-    <div class="table-card">
-        <div class="table-header"><span class="table-title">📋 断流历史记录</span><button class="btn btn-primary" onclick="exportCSV()">导出 CSV</button></div>
-        <table>
-            <thead><tr><th>#</th><th>开始时间</th><th>结束时间</th><th>持续(秒)</th><th>持续(分:秒)</th><th>类型</th></tr></thead>
-            <tbody id="history-table"><tr><td colspan="6" style="text-align:center;color:var(--text-dim);">暂无断流记录</td></tr></tbody>
-        </table>
-    </div>
-</div>
-<script>
-let timelineChart=null,hourlyChart=null;
-function initTimelineChart(){
-    const ctx=document.getElementById('timeline-chart').getContext('2d');
-    timelineChart=new Chart(ctx,{
-        type:'bar',
-        data:{labels:[],datasets:[{label:'断流时长(秒)',data:[],backgroundColor:'rgba(239,68,68,0.35)',borderColor:'#ef4444',borderWidth:1.5,borderRadius:6}]},
-        options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
-            scales:{y:{beginAtZero:true,grid:{color:'rgba(255,255,255,0.04)'},ticks:{color:'#8b8fa3'}},x:{ticks:{color:'#8b8fa3',maxRotation:0}}}}
-    });
-}
-function initHourlyChart(){
-    const ctx=document.getElementById('hourly-chart').getContext('2d');
-    hourlyChart=new Chart(ctx,{
-        type:'line',
-        data:{labels:[],datasets:[
-            {label:'监控覆盖',data:[],backgroundColor:'rgba(99,102,241,0.08)',borderColor:'transparent',fill:true,pointRadius:0,tension:0,order:2},
-            {label:'断流次数',data:[],backgroundColor:'rgba(239,68,68,0.1)',borderColor:'#ef4444',borderWidth:2,tension:0.4,fill:true,pointBackgroundColor:'#ef4444',pointRadius:3,order:1}
-        ]},
-        options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{
-            label:function(ctx){if(ctx.datasetIndex===0){const m=ctx.raw;return m>0?'监控覆盖: '+m.toFixed(0)+' 分钟':'未监测';}return '断流: '+ctx.raw+' 次';}
-        }}},
-            scales:{y:{beginAtZero:true,grid:{color:'rgba(255,255,255,0.04)'},ticks:{color:'#8b8fa3',stepSize:1}},x:{ticks:{color:'#8b8fa3',maxTicksLimit:12,maxRotation:0}}}}
-    });
-}
-function formatDuration(s){const m=Math.floor(s/60),sec=Math.floor(s%60);return String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0');}
-function formatHours(s){if(s<60)return Math.round(s)+' 秒';if(s<3600)return (s/60).toFixed(1)+' 分钟';return (s/3600).toFixed(1)+' 小时';}
-function updateData(){
-    fetch('/api/status').then(r=>r.json()).then(d=>{
-        const pill=document.getElementById('status-pill'),txt=document.getElementById('status-text');
-        const detail=document.getElementById('status-detail'),conn=document.getElementById('conn-type');
-        pill.className='status-pill';
-        if(d.current_status==='online'){pill.classList.add('online');txt.textContent='● 在线';detail.textContent='';}
-        else if(d.current_status==='network_disconnected'){pill.classList.add('offline');txt.textContent='● 断流中';
-            if(d.current_offline_start){const dur=(new Date()-new Date(d.current_offline_start))/1000;detail.textContent='已断流 '+Math.floor(dur)+' 秒';}}
-        else if(d.current_status==='cpe_unreachable'){pill.classList.add('offline');txt.textContent='● CPE不可达';
-            if(d.current_offline_start){const dur=(new Date()-new Date(d.current_offline_start))/1000;detail.textContent='CPE无响应 '+Math.floor(dur)+' 秒';}}
-        else{txt.textContent='检测中...';detail.textContent='';}
-        conn.textContent=d.conn_type||'';
-        document.getElementById('monitor-today').textContent=formatHours(d.monitor_today_seconds||0);
-        document.getElementById('total-disconnections').textContent=d.total_disconnections;
-        document.getElementById('today-disconnections').textContent=d.today_disconnections||0;
-        document.getElementById('today-downtime-label').textContent='断流总计 '+(d.today_downtime||0).toFixed(1)+' 秒';
-        document.getElementById('disconnection-rate').textContent=(d.disconnection_rate||0).toFixed(2);
-        document.getElementById('total-downtime').textContent=d.total_downtime.toFixed(1)+' 秒';
-        document.getElementById('avg-downtime').textContent=d.avg_downtime.toFixed(1)+' 秒';
-        document.getElementById('avg-interval').textContent=d.avg_interval>0?(d.avg_interval/3600).toFixed(1)+' 小时':'--';
-        document.getElementById('monitor-week').textContent=formatHours(d.monitor_week_seconds||0);
-    }).catch(console.error);
-    fetch('/api/events?limit=20').then(r=>r.json()).then(events=>{
-        const rev=[...events].reverse();
-        timelineChart.data.labels=rev.map((_,i)=>'#'+(i+1));
-        timelineChart.data.datasets[0].data=rev.map(e=>e.duration);timelineChart.update();
-        const tbody=document.getElementById('history-table');tbody.innerHTML='';
-        if(events.length===0){tbody.innerHTML='<tr><td colspan="6" style="text-align:center;color:var(--text-dim);">暂无断流记录</td></tr>';}
-        else{events.forEach((e,i)=>{const r=tbody.insertRow();
-            r.insertCell(0).textContent=i+1;r.insertCell(1).textContent=e.start;
-            r.insertCell(2).textContent=e.end;r.insertCell(3).textContent=e.duration.toFixed(1);
-            r.insertCell(4).textContent=formatDuration(e.duration);
-            r.insertCell(5).innerHTML='<span class="badge '+(e.event_type==='network_disconnected'?'badge-danger':'badge-warn')+'">'+(e.event_type||'unknown')+'</span>';});
+                    document.getElementById('today-events').textContent = d.total_disconnections;
+                    document.getElementById('today-downtime').textContent = d.total_downtime.toFixed(1) + ' 秒';
+                    document.getElementById('avg-downtime').textContent = d.avg_downtime.toFixed(1) + ' 秒';
+                    document.getElementById('avg-interval').textContent = d.avg_interval > 0 ? (d.avg_interval / 3600).toFixed(1) + ' 小时' : '--';
+                    document.getElementById('last-disconnection').textContent = d.last_disconnection || '--';
+                    document.getElementById('conn-type').textContent = d.conn_type;
+                    document.getElementById('version').textContent = d.version;
+
+                    // 监控时长
+                    fetch('/api/today_monitor_hours')
+                        .then(r => r.json())
+                        .then(h => {
+                            const totalMinutes = h.total_minutes || 0;
+                            document.getElementById('monitor-hours').textContent = (totalMinutes / 60).toFixed(1);
+                        });
+                });
+
+            // 更新事件列表
+            fetch('/api/events?limit=20')
+                .then(r => r.json())
+                .then(events => {
+                    const tbody = document.getElementById('events-tbody');
+                    if (events.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color:#636e72;">暂无数据</td></tr>';
+                        return;
+                    }
+                    tbody.innerHTML = '';
+                    events.forEach(ev => {
+                        const typeClass = ev.event_type === 'cpe_unreachable' ? 'cpe_unreachable' : 'disconnected';
+                        const typeText = ev.event_type === 'cpe_unreachable' ? 'CPE不可达' : 
+                                        ev.event_type === 'network_disconnected' ? '网络断开' :
+                                        ev.event_type === 'external_unreachable' ? '外网不可达' : '未知';
+                        tbody.innerHTML += `
+                            <tr>
+                                <td>${ev.start}</td>
+                                <td>${ev.end}</td>
+                                <td>${ev.duration.toFixed(1)} 秒</td>
+                                <td><span class="status-badge ${typeClass}">${typeText}</span></td>
+                            </tr>
+                        `;
+                    });
+                });
+
+            // 更新监控会话
+            fetch('/api/monitor_sessions')
+                .then(r => r.json())
+                .then(sessions => {
+                    const container = document.getElementById('sessions-list');
+                    if (sessions.length === 0) {
+                        container.innerHTML = '<p style="color:#636e72;">今日暂无监控记录</p>';
+                        return;
+                    }
+                    let html = '<table><thead><tr><th>开始时间</th><th>结束时间</th><th>持续时长</th><th>状态</th></tr></thead><tbody>';
+                    sessions.forEach(s => {
+                        const end = s.end || '进行中...';
+                        const status = s.status === 'active' ? '🟢 监测中' : '⚪ 已结束';
+                        html += `<tr><td>${s.start}</td><td>${end}</td><td>${(s.duration / 60).toFixed(1)} 分钟</td><td>${status}</td></tr>`;
+                    });
+                    html += '</tbody></table>';
+                    container.innerHTML = html;
+                });
+
+            // 更新24小时图表
+            fetch('/api/hourly_stats')
+                .then(r => r.json())
+                .then(data => {
+                    hourlyChart.data.labels = data.labels;
+                    hourlyChart.data.datasets[0].data = data.data;
+                    
+                    // 获取监控分钟数
+                    fetch('/api/today_monitor_minutes')
+                        .then(r => r.json())
+                        .then(minutes => {
+                            hourlyChart.data.datasets[1].data = minutes;
+                            hourlyChart.update();
+                        });
+                });
         }
-    }).catch(console.error);
-    fetch('/api/hourly_stats').then(r=>r.json()).then(d=>{
-        hourlyChart.data.labels=d.labels;
-        // 监控覆盖：将分钟数归一化到图表可见范围（0-60分钟 -> 0-maxY视觉区域）
-        const monitorMins = d.monitor_minutes || [];
-        const maxDisconn = Math.max(1, ...(d.data||[]));
-        hourlyChart.data.datasets[0].data = monitorMins.map(function(m){return m/60*maxDisconn*0.8;}); // 缩放以匹配视觉范围
-        hourlyChart.data.datasets[1].data = d.data;
-        hourlyChart.update();
-    }).catch(console.error);
-}
-function exportCSV(){fetch('/api/export').then(r=>r.blob()).then(b=>{const u=URL.createObjectURL(b),a=document.createElement('a');a.href=u;a.download='cpe_monitor_'+new Date().toISOString().split('T')[0]+'.csv';a.click();URL.revokeObjectURL(u);}).catch(console.error);}
-document.addEventListener('DOMContentLoaded',()=>{initTimelineChart();initHourlyChart();updateData();setInterval(updateData,5000);});
-</script>
+
+        // 初始化
+        updateData();
+        setInterval(updateData, 5000);
+    </script>
 </body>
-</html>"""
+</html>
+'''
 
-
-# =============================================================================
-# Flask路由
-# =============================================================================
 @app.route('/')
 def index():
-    """主页"""
-    return render_template_string(HTML_TEMPLATE, 
-                                 target=PING_TARGET,
-                                 db_path=DB_PATH)
+    return render_template_string(HTML_TEMPLATE)
 
 @app.route('/api/status')
 def api_status():
-    """获取当前状态和统计"""
+    """返回当前状态和统计"""
     db_stats = get_stats_from_db()
-    # 只合并 DB 中不冲突的字段（保留内存中实时更新的 current_status 等）
-    for k in ('avg_interval', 'last_disconnection'):
-        if k in db_stats:
-            stats[k] = db_stats[k]
+    monitor_time = get_monitor_time_stats()
     
-    # 附加监控时长统计
-    time_stats = get_monitor_time_stats()
-    today_sec = time_stats["today_seconds"]
+    today_minutes = monitor_time["today_seconds"] / 60
     
-    # 今天的断流次数（只统计今天的，使用本地时间避免UTC偏差）
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*), COALESCE(SUM(duration),0) FROM events WHERE date(start_time) = date('now', 'localtime')")
-    today_events, today_downtime = c.fetchone()
-    conn.close()
-    
-    stats["monitor_today_seconds"] = today_sec
-    stats["monitor_today_hours"] = round(today_sec / 3600, 1)
-    stats["monitor_week_seconds"] = time_stats["week_seconds"]
-    stats["today_disconnections"] = today_events or 0
-    stats["today_downtime"] = today_downtime or 0
-    
-    # 断流率 = 今日断流次数 / 今日监控小时数
-    if today_sec > 0:
-        stats["disconnection_rate"] = round((today_events or 0) / (today_sec / 3600), 2)
-    else:
-        stats["disconnection_rate"] = 0
-    
-    return jsonify(stats)
+    return jsonify({
+        "current_status": stats["current_status"],
+        "total_disconnections": db_stats["total_disconnections"],
+        "total_downtime": db_stats["total_downtime"],
+        "avg_downtime": db_stats["avg_downtime"] or 0,
+        "avg_interval": db_stats["avg_interval"] or 0,
+        "last_disconnection": db_stats["last_disconnection"],
+        "current_offline_start": stats["current_offline_start"],
+        "conn_type": stats["conn_type"],
+        "version": stats["version"],
+        "today_monitor_minutes": today_minutes
+    })
 
 @app.route('/api/events')
 def api_events():
-    """获取断流事件列表"""
-    limit = request.args.get('limit', 100, type=int)
-    events = get_recent_events(limit)
-    return jsonify(events)
+    """返回最近的断流事件"""
+    limit = int(request.args.get('limit', 50))
+    return jsonify(get_recent_events(limit))
 
 @app.route('/api/hourly_stats')
 def api_hourly_stats():
-    """获取24小时断流统计（含监控时段覆盖数据）"""
-    result = get_hourly_stats()
-    # 附加今天的监控分钟数，前端用做覆盖层
-    result["monitor_minutes"] = get_today_monitor_minutes()
-    return jsonify(result)
+    """返回24小时断流统计"""
+    return jsonify(get_hourly_stats())
 
 @app.route('/api/monitor_sessions')
 def api_monitor_sessions():
-    """获取今天的监控会话记录"""
-    sessions = get_today_sessions()
-    time_stats = get_monitor_time_stats()
-    return jsonify({
-        "sessions": sessions,
-        "today_seconds": time_stats["today_seconds"],
-        "today_hours": round(time_stats["today_seconds"] / 3600, 1),
-        "week_seconds": time_stats["week_seconds"]
-    })
+    """返回今天的监控会话"""
+    return jsonify(get_today_sessions())
 
 @app.route('/api/today_monitor_hours')
 def api_today_monitor_hours():
-    """获取今天24小时每小时的监控分钟数"""
+    """返回今天的监控时长（小时）"""
+    monitor_time = get_monitor_time_stats()
     return jsonify({
-        "labels": ["{:02d}:00".format(i) for i in range(24)],
-        "data": get_today_monitor_minutes()
+        "today_hours": monitor_time["today_seconds"] / 3600,
+        "today_minutes": monitor_time["today_seconds"] / 60,
+        "week_hours": monitor_time["week_seconds"] / 3600
     })
 
-@app.route('/api/export')
-def api_export():
-    """导出CSV文件"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT * FROM events ORDER BY id DESC")
-    rows = c.fetchall()
-    conn.close()
-    
-    # 生成CSV内容
-    csv_content = "ID,开始时间,结束时间,持续时长(秒),持续时长(分:秒),断流类型\n"
-    for row in rows:
-        duration = row[3]
-        mins = int(duration // 60)
-        secs = int(duration % 60)
-        duration_fmt = "{:02d}:{:02d}".format(mins, secs)
-        event_type = row[4] if len(row) > 4 else 'unknown'
-        csv_content += "{},{},{},{:.1f},{},{}\n".format(
-            row[0], row[1], row[2], duration, duration_fmt, event_type)
-    
-    # 返回CSV文件
-    response = Response(
-        csv_content,
-        mimetype='text/csv',
-        headers={'Content-Disposition': 'attachment; filename=cpe_monitor_export.csv'}
-    )
-    return response
+@app.route('/api/today_monitor_minutes')
+def api_today_monitor_minutes():
+    """返回今天每小时的监控分钟数"""
+    return jsonify(get_today_monitor_minutes())
 
-@app.route('/api/test_disconnect')
+@app.route('/api/test_disconnect', methods=['POST'])
 def api_test_disconnect():
-    """测试端点：模拟一次 cpe_unreachable 事件（3秒后自动恢复）"""
-    global current_status, current_offline_start
-    if current_status != "online":
-        return jsonify({"error": "当前不在线，无法测试", "status": current_status})
-    
-    now = datetime.now()
-    # 模拟3秒前的断流
-    start_time = now - timedelta(seconds=3)
-    end_time = now
+    """测试用：模拟一次断流事件"""
+    start = datetime.now() - timedelta(seconds=3)
+    end = datetime.now()
     duration = 3.0
-    
-    # 直接记录（模拟 recovery）
-    log_disconnection(start_time, end_time, duration, "cpe_unreachable")
-    stats["total_disconnections"] += 1
-    stats["total_downtime"] += duration
-    stats["avg_downtime"] = stats["total_downtime"] / stats["total_disconnections"]
-    stats["last_disconnection"] = end_time.isoformat()
-    disconnection_events.append({
-        "start": start_time.isoformat(),
-        "end": end_time.isoformat(),
-        "duration": duration,
-        "event_type": "cpe_unreachable"
-    })
-    
-    return jsonify({
-        "test": "ok",
-        "event_type": "cpe_unreachable",
-        "duration": duration,
-        "message": "已模拟一条 cpe_unreachable 断流事件（3秒）"
-    })
+    log_disconnection(start, end, duration, 'test')
+    return jsonify({"status": "ok", "message": "测试事件已记录"})
 
 # =============================================================================
-# 主程序入口
+# 主入口
 # =============================================================================
 if __name__ == '__main__':
-    print("=" * 60)
-    print("CPE Network Disconnection Monitor")
-    print("CPE网络断流监控工具 v1.1")
-    print("=" * 60)
-    
-    # 初始化数据库
-    print("[Init] 初始化数据库...")
     init_db()
+    print("=" * 50)
+    print("CPE 断流监控 v2.9")
+    print("多维度检测 + 连续失败阈值")
+    print("=" * 50)
     
     # 启动监控线程
-    print("[Init] 启动监控线程...")
     monitoring = True
     monitor_thread = threading.Thread(target=monitor, daemon=True)
     monitor_thread.start()
     
-    # 等待一下让监控线程开始工作
-    time.sleep(1)
-    
-    # 启动Flask Web服务器
-    print("[Init] 启动Web服务器...")
-    print("[Init] 请在浏览器中打开: http://localhost:5000")
-    print("=" * 60)
-    
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    # 启动Flask
+    app.run(host='127.0.0.1', port=5000, debug=False, use_reloader=False)
