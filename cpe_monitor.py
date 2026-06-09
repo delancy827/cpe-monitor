@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CPE Network Disconnection Monitor v2.8
+CPE Network Disconnection Monitor v2.8.1
 CPE网络断流监控工具 - 快慢分离检测：ping每秒 + netsh每30秒 + 失败重试
-CPE网络断流监控工具 - 三重检测：网络接口/CPE网关/外网连通性
+修复：单实例检测逻辑、时区偏差、24小时统计范围
 """
 
 import threading
@@ -58,7 +58,7 @@ stats = {
     "current_status": "online",
     "current_offline_start": None,
     "conn_type": "检测中...",
-    "version": "v2.8"
+    "version": "v2.8.1"
 }
 
 # =============================================================================
