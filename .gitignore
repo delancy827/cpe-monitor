@@ -10,9 +10,17 @@ __pycache__/
 # Database (contains personal monitoring data)
 cpe_monitor.db
 
+# Runtime state files (contain personal network data)
+cell_lock_state.json
+*.log
+
+# Config (user-specific, not for repo)
+config.py
+.env
+
 # IDE
 .vscode/
 .idea/
 
-# Log files
-*.log
+# Screenshots
+debug_screenshots/

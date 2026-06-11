@@ -21,7 +21,7 @@ CPE网络断流监控工具，托盘常驻后台运行，实时检测网络断�
 
 ### 方式一：直接下载 EXE（推荐）
 
-从 [Releases](https://github.com/delancy827/cpe-monitor/releases) 下载最新的 `CPEMonitor.exe`，放到任意目录双击运行。
+从 [Releases](../../releases) 下载最新的 `CPEMonitor.exe`，放到任意目录双击运行。
 
 ### 方式二：从源码运行
 

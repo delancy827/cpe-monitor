@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CPE Network Disconnection Monitor - Desktop Edition v2.8.1
+CPE Network Disconnection Monitor - Desktop Edition v2.9.2
 系统托盘模式：托盘常驻 + 浏览器打开监控面板 + 开机自启选项
 修复：单实例检测改为杀掉旧进程后重启，避免托盘无法创建
 """
@@ -13,9 +13,23 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 import cpe_monitor as core
+import cpe_toggle
 
 FLASK_PORT = 5000
 FLASK_URL = "http://127.0.0.1:{}".format(FLASK_PORT)
+
+def _run_cell_lock_cli(action):
+    """作为子进程入口运行锁小区模块。"""
+    args = ["--no-pause"]
+    if getattr(sys, 'frozen', False):
+        pass
+    if action == "lock":
+        args.insert(0, "--lock")
+    elif action == "unlock":
+        args.insert(0, "--unlock")
+    elif action == "status":
+        args.insert(0, "--status")
+    return cpe_toggle.main(args)
 
 # =============================================================================
 # 单实例检测与清理
@@ -168,16 +182,51 @@ def _toggle_browser(icon=None, item=None):
     print("[Tray] 打开浏览器...")
     webbrowser.open(FLASK_URL)
 
+def _run_cell_lock_action(action):
+    """在独立进程里执行锁小区操作，避免阻塞托盘和监控线程。"""
+    try:
+        if getattr(sys, 'frozen', False):
+            cmd = [sys.executable, "--{}-cell".format(action)]
+        else:
+            cmd = [sys.executable, os.path.join(SCRIPT_DIR, "cpe_monitor_desktop.py"), "--{}-cell".format(action)]
+        print("[CellLock] 启动操作: {}".format("锁定" if action == "lock" else "解锁"))
+        subprocess.Popen(
+            cmd,
+            cwd=SCRIPT_DIR,
+            creationflags=subprocess.CREATE_NEW_CONSOLE if hasattr(subprocess, 'CREATE_NEW_CONSOLE') else 0
+        )
+    except Exception as e:
+        print("[CellLock] 启动失败:", e)
+
+def _lock_cell(icon=None, item=None):
+    """托盘菜单：锁定到 PCI 990"""
+    _run_cell_lock_action("lock")
+
+def _unlock_cell(icon=None, item=None):
+    """托盘菜单：解除锁小区"""
+    _run_cell_lock_action("unlock")
+
+def _refresh_cell_status(icon=None, item=None):
+    """托盘菜单：只读刷新锁频状态"""
+    _run_cell_lock_action("status")
+
+def _is_cell_locked_cached():
+    """读取锁频状态缓存；未知时按未锁定处理。"""
+    try:
+        state = cpe_toggle.read_state_cache(max_age_seconds=3600)
+        return bool(state and state.get("locked"))
+    except Exception:
+        return False
+
 def _quit_app(icon=None, item=None):
     """退出应用：先结束监控会话再退出"""
     print("[Exit] 正在退出...")
-    # 先结束监控会话，确保数据库正确记录结束时间和时长
-    try:
-        core.end_monitor_session(core.monitor_session_id)
-    except Exception as e:
-        print("[Exit] 结束监控会话失败:", e)
     core.monitoring = False
-    time.sleep(1)
+    try:
+        if core.monitor_thread and core.monitor_thread.is_alive():
+            core.monitor_thread.join(timeout=6)
+    except Exception as e:
+        print("[Exit] 等待监控线程结束失败:", e)
     try:
         icon.stop()
     except:
@@ -190,6 +239,10 @@ def start_tray():
     img = _load_tray_image()
     menu = pystray.Menu(
         pystray.MenuItem("打开监控面板", _toggle_browser, default=True),
+        pystray.MenuItem("锁定990频点", _lock_cell, visible=lambda item: not _is_cell_locked_cached()),
+        pystray.MenuItem("解锁频点", _unlock_cell, visible=lambda item: _is_cell_locked_cached()),
+        pystray.MenuItem("刷新锁频状态", _refresh_cell_status),
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem(
             "开机自启",
             _toggle_autostart,
@@ -205,13 +258,20 @@ def start_tray():
 # 主入口
 # =============================================================================
 def main():
+    if "--lock-cell" in sys.argv:
+        return _run_cell_lock_cli("lock")
+    if "--unlock-cell" in sys.argv:
+        return _run_cell_lock_cli("unlock")
+    if "--cell-status" in sys.argv:
+        return _run_cell_lock_cli("status")
+
     # 先杀掉占用5000端口的旧进程，确保托盘能正常创建
     if is_already_running():
         print("[Singleton] 检测到旧进程，正在清理...")
         kill_existing_instance()
 
     print("=" * 50)
-    print("CPE 断流监控 v2.8.1")
+    print("CPE 断流监控 v2.9.2")
     print("托盘常驻后台 | 点击托盘打开监控面板")
     print("开机自启: {}".format("已启用" if is_autostart_enabled() else "未启用"))
     print("=" * 50)
@@ -243,4 +303,4 @@ def main():
     start_tray()
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main() or 0)

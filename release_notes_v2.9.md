@@ -67,7 +67,7 @@ elif consecutive_successes >= 2 and current_status == "disconnected":
 ### 📦 安装说明
 
 1. 下载 CPEMonitor.exe
-2. 放到任意目录（建议 `F:\CPEMonitor\`）
+2. 放到任意目录运行
 3. 首次运行会自动创建数据库文件
 4. 右键托盘图标可设置开机自启
 
